@@ -1,0 +1,9 @@
+REQUIREMENTS 
+
+We have an external mock server, that lives at "https://350e1661-604c-4300-b78b-4e3002bfeae4.mock.pstmn.io" and exposes three endpoints, one for each Salesforce object we need to populate:
+/accountEndpoint, /contactEndpoint, and /caseEndpoint
+
+All three follow the exact same rules: they only accept GET requests, they require a query parameter called type (a number between 0 and 6), and they always respond with JSON.
+
+We have to be able to trigger the process with a 'type' number --> the orchestrator calls the Account endpoint, gets the nested JSON back, deserializes it into your wrapper, validates the data, maps it to an Account record, upserts it
+The same should be possible for Contacts and Cases as well.
