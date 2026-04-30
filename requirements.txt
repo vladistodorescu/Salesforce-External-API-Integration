@@ -7,3 +7,5 @@ All three follow the exact same rules: they only accept GET requests, they requi
 
 We have to be able to trigger the process with a 'type' number --> the orchestrator calls the Account endpoint, gets the nested JSON back, deserializes it into your wrapper, validates the data, maps it to an Account record, upserts it
 The same should be possible for Contacts and Cases as well.
+
+- made all fields on Integration_Log__c read-only
