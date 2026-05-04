@@ -1,11 +1,235 @@
-REQUIREMENTS 
+# TechTrek Salesforce Integration — Project Documentation
 
-We have an external mock server, that lives at "https://350e1661-604c-4300-b78b-4e3002bfeae4.mock.pstmn.io" and exposes three endpoints, one for each Salesforce object we need to populate:
-/accountEndpoint, /contactEndpoint, and /caseEndpoint
+---
 
-All three follow the exact same rules: they only accept GET requests, they require a query parameter called type (a number between 0 and 6), and they always respond with JSON.
+## 1. Project Overview
 
-We have to be able to trigger the process with a 'type' number --> the orchestrator calls the Account endpoint, gets the nested JSON back, deserializes it into your wrapper, validates the data, maps it to an Account record, upserts it
-The same should be possible for Contacts and Cases as well.
+The goal of this project was to build a Salesforce integration that periodically extracts data from an external API (TechTrek) and upserts it into the Salesforce org as standard and custom object records. The integration had to be robust, bulkified, and fully logged.
 
-- made all fields on Integration_Log__c read-only
+---
+
+## 2. Requirements
+
+### 2.1 API Integration
+- Call three external endpoints:
+  - `/accountEndpoint` — returns organization data
+  - `/contactEndpoint` — returns person/contact data
+  - `/caseEndpoint` — returns service ticket data
+- Each endpoint supports a `type` parameter (values 0 through 6) representing different organizations
+- All HTTP communication must be handled via Salesforce `HttpRequest` / `HttpResponse`
+
+### 2.2 Batch Processing
+- Implement a `Batch Apex` class that:
+  - Iterates over all type values (0–6)
+  - Calls all three endpoints for each type
+  - Parses and upserts the returned data
+  - Can be run manually from Anonymous Apex
+  - Can be scheduled via `Schedulable`
+  - Must not stop on first error — continue processing remaining records
+
+### 2.3 JSON Mapping
+- API responses do NOT use Salesforce field API names
+- Manual field mapping required between JSON structure and Salesforce fields
+- Wrapper classes required to deserialize JSON responses
+
+### 2.4 Record Upsert Logic
+- For each object type:
+  - Query existing records in bulk (one SOQL per object, outside loops)
+  - If a matching record exists → update only changed fields
+  - If no match exists → insert new record
+- Matching keys:
+  - Account → `Name`
+  - Contact → `CNP__c` (personal identifier)
+  - Case → `Reference_Number__c`
+
+### 2.5 Bulkification
+- No SOQL inside loops
+- No DML inside loops
+- All inserts and updates via bulk `Database.insert` / `Database.update` with `allOrNone = false`
+
+### 2.6 Error Handling
+The solution must handle and log all of the following without stopping execution:
+- HTTP errors (non-200 status codes)
+- JSON deserialization failures
+- Apex mapping exceptions (null nested fields, etc.)
+- DML failures (via `Database.SaveResult`)
+
+### 2.7 Integration Logging
+A custom object `Integration_Log__c` must be created with the following fields:
+
+| Field Label     | API Name            | Type          | Description                        |
+|-----------------|---------------------|---------------|------------------------------------|
+| Endpoint        | `Endpoint__c`       | Text          | Endpoint called                    |
+| Request Type    | `Request_Type__c`   | Text          | Type parameter value (0–6)         |
+| Status Code     | `Status_Code__c`    | Number        | HTTP status code                   |
+| Error Message   | `Error_Message__c`  | Long Text Area| Error description                  |
+| Payload         | `Payload__c`        | Long Text Area| Raw response body or serialized record |
+| Error Type      | `Error_Type__c`     | Text          | HTTP / JSON / APEX / DML           |
+| Execution Time  | `Execution_Time__c` | DateTime      | Timestamp of the error             |
+
+### 2.8 Test Coverage
+- Minimum 75% code coverage required for deployment
+- Tests must use mock HTTP callouts (`HttpCalloutMock`)
+- Tests must cover insert path, update path, bad JSON path, empty list guard, and error logging
+
+---
+
+## 3. What Was Developed
+
+### 3.1 `TechTrekApiService`
+Handles all outbound HTTP communication.
+- `execute(endpoint, typeValue)` — private method that builds the URL, sends the GET request, and returns an `ApiResponse` wrapper
+- `callAccountEndpoint(typeValue)` — public helper
+- `callContactEndpoint(typeValue)` — public helper
+- `callCaseEndpoint(typeValue)` — public helper
+- Inner class `ApiResponse` — holds `statusCode`, `status`, `body`, and computed `isSuccess` property
+
+### 3.2 Wrapper Classes
+Three wrapper classes used for JSON deserialization:
+
+**`AccountWrapper`**
+Maps the `organization` JSON structure to Account fields:
+- `identity.registeredName` → `Name`
+- `identity.taxIdentifier` → `Sic`
+- `classification.sector` → `Industry`
+- `classification.marketSegment` → `Market_Segment__c`
+- `financialOverview.annualTurnover` → `AnnualRevenue`
+- `financialOverview.fiscalCurrency` → `Fiscal_Currency__c`
+- `financialOverview.fiscalYear` → `Fiscal_Year__c`
+- `workforce.employeeCount` → `NumberOfEmployees`
+- `workforce.departments` → `Departments__c` (joined as comma-separated string)
+- `communicationChannels.primaryPhone` → `Phone`
+- `communicationChannels.website` → `Website`
+- `locations.headOffice.streetLine` → `BillingStreet`
+- `locations.headOffice.cityName` → `BillingCity`
+- `locations.headOffice.postalCode` → `BillingPostalCode`
+- `locations.headOffice.countryName` → `BillingCountry`
+
+**`ContactWrapper`**
+Maps the `personProfile` JSON structure to Contact fields:
+- `identity.givenName` → `FirstName`
+- `identity.familyName` → `LastName`
+- `identity.personalIdentifier` → `CNP__c`
+- `professionalDetails.jobTitle` → `Title`
+- `professionalDetails.division` → `Department`
+- `communication.emails[isPrimary].emailAddress` → `Email`
+- `communication.emails` → `Related_Emails__c` (all emails joined)
+- `communication.phones` → `Related_Phones__c` (all phones joined)
+- `residence.cityName` → `MailingCity`
+- `residence.countryName` → `MailingCountry`
+
+**`CaseWrapper`**
+Maps the `serviceTicket` JSON structure to Case fields:
+- `ticketInfo.referenceNumber` → `Reference_Number__c`
+- `ticketInfo.title` → `Subject`
+- `ticketInfo.description` → `Description`
+- `classification.category` → `Category__c`
+- `classification.priorityLevel` → `Priority`
+- `statusTracking.currentStage` → `Status`
+- `statusTracking.originChannel` → `Origin`
+- `requesterDetails.fullName` → `SuppliedName`
+- `requesterDetails.emailAddress` → `SuppliedEmail`
+
+### 3.3 `RecordService`
+Contains three static methods, all following the same consistent 4-step pattern:
+
+**Step 1 — Deserialize**
+Loop through `ApiResponse` list. Each deserialization is wrapped in try/catch — failures are logged as `JSON` error type and the response is skipped. If nothing was successfully deserialized, logs are flushed and the method returns early.
+
+**Step 2 — Query**
+One single SOQL query using an `IN` clause on the collected keys (Names / CNPs / Reference Numbers). Results stored in a `Map` for O(1) lookup.
+
+**Step 3 — Map and Match**
+Loop through wrappers. Each wrapper is wrapped in try/catch. For each wrapper:
+- If a matching record is found in the map → check each field for changes and update only if different, then add to `toUpdate` list
+- If no match → build new record and add to `toInsert` list
+- Exceptions are logged as `APEX` error type
+
+**Step 4 — DML**
+- `Database.update(recordsToUpdate, false)` + index-based `SaveResult` loop for DML error logging
+- `Database.insert(recordsToInsert, false)` + index-based `SaveResult` loop for DML error logging
+- Single `insert logsToInsert` at the very end
+
+Methods: `upsertAccounts`, `upsertContacts`, `upsertCases`
+
+### 3.4 `TechTrekBatch`
+Implements `Database.Batchable<Integer>`, `Database.AllowsCallouts`, `Schedulable`.
+
+- `start()` — returns `[0, 1, 2, 3, 4, 5, 6]` (or `[0]` during test execution via `Test.isRunningTest()`)
+- `execute()` — for each type value in scope:
+  - Calls all three endpoints
+  - Non-200 responses → logged as `HTTP` error type
+  - Callout exceptions → logged as `APEX` error type
+  - Successful responses collected into separate lists
+  - Lists passed to `RecordService.upsertAccounts/Contacts/Cases`
+  - All batch-level logs flushed in one DML at the end
+- `finish()` — logs completion
+- `execute(SchedulableContext)` — calls `Database.executeBatch(new TechTrekBatch(), 1)`
+
+**Manual execution:**
+```apex
+Database.executeBatch(new TechTrekBatch(), 1);
+```
+
+**Scheduled execution:**
+```apex
+System.schedule('TechTrekBatch Daily', '0 0 2 * * ?', new TechTrekBatch());
+```
+
+### 3.5 Test Classes
+
+**`TechTrekApiMock`**
+Implements `HttpCalloutMock`. Accepts separate status codes for each endpoint. Returns hardcoded JSON stubs for 200 responses and a generic error body for non-200.
+
+**`TechTrekApiServiceTest`**
+- `testGetAccountSuccess` — verifies all Account wrapper fields from a 200 response
+- `testGetContactSuccess` — verifies all Contact wrapper fields from a 200 response
+- `testGetCaseSuccess` — verifies all Case wrapper fields from a 200 response
+
+**`RecordServiceTest`**
+- Insert path, update path, bad JSON path, and empty list guard for all three methods
+- `@TestSetup` pre-inserts matching records to trigger update path
+- Additional tests for field-level change coverage and DML error logging via `SaveResult`
+
+**`TechTrekBatchTest`**
+- `testBatchSuccess` — all 200s, records inserted, no logs created
+- `testBatchHttpError` — all 400s, no records inserted, HTTP logs created with correct field values
+- `testBatchPartialHttpError` — accounts succeed, contacts and cases fail, proves batch continues on partial failure
+- `testBatchSchedulable` — verifies the job is registered in `CronTrigger`
+- `testBatchHttpError_LogFields` — asserts specific log field values per endpoint
+- `testBatchApexError_LogCreated` — triggers APEX catch block via null status codes
+
+---
+
+## 4. Custom Fields Created
+
+### On `Account`:
+- `Market_Segment__c` — Text
+- `Fiscal_Currency__c` — Text
+- `Fiscal_Year__c` — Number (Integer)
+- `Departments__c` — Long Text Area
+
+### On `Contact`:
+- `CNP__c` — Text (unique, used as matching key)
+- `Related_Emails__c` — Long Text Area
+- `Related_Phones__c` — Long Text Area
+
+### On `Case`:
+- `Reference_Number__c` — Text (unique, used as matching key)
+- `Category__c` — Text
+
+### Custom Object:
+- `Integration_Log__c` — as described in section 2.7
+
+---
+
+## 5. Design Decisions
+
+| Decision | Reason |
+|----------|--------|
+| `Database.insert/update` with `allOrNone = false` | Allows partial saves — one bad record does not roll back the rest |
+| Index-based `SaveResult` loop | Allows serializing the exact failed record into `Payload__c` |
+| `Test.isRunningTest()` in `start()` | Prevents "No more than one executeBatch" test error by limiting scope to one item |
+| Scope size = 1 in batch | Each transaction handles one type value → 3 callouts, well within the 100 callout limit |
+| Early return after deserialization if set is empty | Avoids unnecessary SOQL and DML when all responses failed to parse |
+| Field-change guards (`if field != value`) | Prevents unnecessary DML updates on unchanged records |
